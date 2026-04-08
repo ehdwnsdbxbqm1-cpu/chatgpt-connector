@@ -102,7 +102,7 @@ ask-gpt는 **웹 브라우저에 열려있는 ChatGPT(또는 다른 AI 서비스
 
 ```
 사용자 클릭 "GPT 리뷰"
-  → Frontend: POST /api/ai-review/stream { provider:"chatgpt", context, question, timeout:240 }
+  → Frontend: POST /api/ai-review/stream { provider:"chatgpt", context, question, task_class:"quick_review" }
   → Router: asyncio.create_task(request_review_stream)
   → Service: provider lock 확인 → _active_providers["chatgpt"] = request_id
   → Service: PhaseStore.create(request_id, prompt_hash, "chatgpt")
@@ -158,6 +158,44 @@ POST /api/ai-review { provider:"chatgpt", action:"ask", context, question }
 | DOM_SELECTOR_MISS | X | DOM 구조 변경됨 | update_selector |
 | NOTEBOOK_NOT_OPENED | X | NotebookLM 노트북 미열림 | open_notebook |
 
+### 4.2 Timeout 정책 분리 (task_class / model / override)
+
+`ai_review_service.py`의 deadline 관리를 프론트 요청 파라미터(`timeout`, `model`)와 분리하고, 서버가 timeout 정책을 강제한다.
+
+#### 4.2.1 요청 계약
+
+프론트는 임의 timeout 대신 `task_class` 중심으로 요청한다.
+
+```json
+{
+  "provider": "chatgpt",
+  "task_class": "quick_review",
+  "context": "...",
+  "question": "...",
+  "timeout_override_sec": 360
+}
+```
+
+`timeout_override_sec`는 선택값이며 서버 허용 범위 밖이면 clamp 또는 무시한다.
+
+#### 4.2.2 서버 강제 정책 (예시)
+
+| task_class | 기본 timeout | 최대 허용 timeout |
+|------------|--------------|-------------------|
+| quick_review | 300s | 420s |
+| deep_reasoning | 420s | 600s |
+
+모델 보정 규칙:
+- GPT-5 계열(`model.startswith("gpt-5")`)은 기본 timeout +180s (예: 300→480s)
+- 단, task_class 상한선을 초과하지 않도록 clamp
+- 사용자 override 허용 범위는 class별 `[min_override, max_override]`로 제한
+
+deadline 계산 순서:
+1. `base = class_default(task_class)`
+2. `base = apply_model_bonus(base, model)`
+3. `effective_default = min(base, class_max(task_class))`
+4. override가 있으면 `effective = clamp(override, min_override, class_max)` 아니면 `effective_default`
+
 ### 4.2 Backoff Retry 메커니즘
 
 CAPTURE_FAILED 또는 CAPTURE_TIMEOUT 발생 시 자동 read 재시도:
@@ -181,7 +219,23 @@ EMPTY_AFTER_COMPLETE 전용 처리:
   - 목적: 300초 lock 고착 방지 (DOM 렌더링 지연은 보통 0.5~3초)
 ```
 
-### 4.3 Frontend SSE→POST Fallback (3-case)
+### 4.3 Soft Extension (PhaseStore 진행 신호 기반)
+
+장시간 추론 모델의 hard timeout 직전 종료를 완화하기 위해 soft extension을 1회 허용한다.
+
+`PhaseStore`는 각 요청마다 `last_progress_at`(마지막 진행 phase 시각)과 `soft_extend_used`를 관리한다.
+
+soft extension 트리거 조건(예시):
+1. 현재 시각이 hard deadline 근접 (`now >= deadline - 30s`)
+2. 최근 진행 신호 존재 (`now - last_progress_at <= 20s`)
+3. `soft_extend_used == false`
+
+조건 만족 시:
+- hard deadline을 1회만 +90s 연장
+- `soft_extend_used = true` 설정
+- timeline에 `SOFT_EXTENDED` 이벤트 기록
+
+### 4.4 Frontend SSE→POST Fallback (3-case + 수동 read)
 
 ```
 SSE 스트림 실패 시 마지막 수신 phase에 따라 분기:
@@ -194,9 +248,14 @@ Case B (생성 중 끊김): lastPhase = "THINKING" 또는 "GENERATING"
 
 Case C (그 외): lastPhase = "SUBMITTING", "WAITING_START", "STABILIZING" 등
   → 3초 대기 → POST /api/ai-review { action: "read", timeout: 10 }
+
+UI/UX 보강:
+- `GENERATING`/`THINKING` 장기 유지 시 “장시간 추론 중” 상태 배지 노출
+- 예상 대기 가이드(예: “최대 8분 소요 가능”) 명시
+- 사용자가 수동으로 `read` fallback을 즉시 트리거할 수 있는 버튼 제공
 ```
 
-### 4.4 탭 복구 체계 (Recovery-on-Demand)
+### 4.5 탭 복구 체계 (Recovery-on-Demand)
 
 ```
 ask/read 요청 수신
@@ -227,6 +286,8 @@ PhaseRecord:
   seq: int               # 내부 순차 카운터 (역전 방어)
   subscribers: list[Queue]  # SSE generator가 구독하는 asyncio.Queue (maxsize=50)
   completed_at: float?   # terminal phase 도달 시 monotonic clock
+  last_progress_at: float?  # 최근 진행 phase 시각
+  soft_extend_used: bool    # soft extension 1회 사용 여부
 
 PhaseStore:
   _records: dict[request_id → PhaseRecord]
@@ -243,6 +304,8 @@ QUEUED → [TAB_RECOVERY] → SUBMITTING → WAITING_START → GENERATING → ST
 ```
 
 9개 Phase. bridge-script에서 emitPhase()로 발생, SW가 WS로 중계, Hub가 StreamReplyTarget.phase_callback 호출, PhaseStore에 기록.
+
+진행 phase(`SUBMITTING`, `WAITING_START`, `GENERATING`, `STABILIZING`) 수신 시 `last_progress_at`을 갱신한다.
 
 ### 5.3 방어 Guard (3개)
 
@@ -288,7 +351,24 @@ RotatingFileHandler: `logs/phase_timeline.log`, 10MB, 3 backup.
 
 ---
 
-## 6. SSE 스트리밍 프로토콜
+## 6. 운영 지표 및 timeout 재보정
+
+timeout 기본값은 고정값이 아니라 운영 지표 기반으로 주기적 재보정을 수행한다.
+
+모델별 필수 지표:
+- 완료 시간 분포: p50 / p95 / p99
+- timeout 비율: timeout_count / total_requests
+- soft extension 발동률 및 연장 후 완료 성공률
+
+권장 루프(주 1회):
+1. 최근 7일 데이터를 모델/태스크 클래스별 집계
+2. p95/p99와 timeout 비율을 기준으로 class 기본 timeout/상한선 조정
+3. GPT-5 bonus(+180s) 적정성 검토
+4. canary 적용 후 재측정
+
+---
+
+## 7. SSE 스트리밍 프로토콜
 
 ### 6.1 엔드포인트
 
@@ -296,7 +376,7 @@ RotatingFileHandler: `logs/phase_timeline.log`, 10MB, 3 backup.
 POST /api/ai-review/stream
 Content-Type: application/json
 Authorization: Bearer <jwt>
-Body: { provider, action:"ask", context, question, timeout, new_chat }
+Body: { provider, action:"ask", context, question, task_class, timeout_override_sec?, new_chat }
 
 Response: Content-Type: text/event-stream
 ```
@@ -337,7 +417,7 @@ async def generate():
 
 ---
 
-## 7. WebSocket Hub 레이어
+## 8. WebSocket Hub 레이어
 
 ### 7.1 역할
 
@@ -398,9 +478,9 @@ Hub.send_to_extension_stream(message, timeout, phase_callback) → dict
 
 ---
 
-## 8. Chrome Extension 레이어
+## 9. Chrome Extension 레이어
 
-### 8.1 Service Worker (background/service-worker.js)
+### 9.1 Service Worker (background/service-worker.js)
 
 **MV3 제약**: Service Worker는 30초 idle 후 종료됨. WebSocket 연결이 끊길 수 있음.
 
@@ -427,7 +507,7 @@ Hub.send_to_extension_stream(message, timeout, phase_callback) → dict
 | health-check | 1분 | AI 탭 스캔 + WS 재연결 확인 |
 | router-cleanup | 5분 | 오래된 pending 요청 정리 |
 
-### 8.2 Bridge Script (ai/bridge-script.js)
+### 9.2 Bridge Script (ai/bridge-script.js)
 
 **주입**: manifest content_scripts로 ChatGPT/NotebookLM 도메인에 자동 주입. ISOLATED world.
 
@@ -502,7 +582,7 @@ function emitPhase(phase, detail = null) {
 }
 ```
 
-### 8.3 adapter-config.json
+### 9.3 adapter-config.json
 
 ```json
 {
